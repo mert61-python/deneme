@@ -1,0 +1,1317 @@
+#include <ESP8266WiFi.h>
+#include <WiFiUdp.h>
+#include <Wire.h>
+#include <Adafruit_MLX90393.h>
+#include <Adafruit_MLX90614.h>
+#include <ArduinoJson.h>
+#include <ArduinoOTA.h>
+#include <ESP8266WebServer.h>
+
+// ——————— CONFIG ———————
+#define COIL_ID 1
+const char* WIFI_SSID = "Mert's Galaxy S23 Ultra";
+const char* WIFI_PSWD = "mert1903.";
+
+// Sabit IP Ayarları
+IPAddress staticIP(192, 168, 152, 200);  // ESP için sabit IP adresi
+IPAddress gateway(192, 168, 152, 178);   // Ağ geçidi (router) IP adresi
+IPAddress subnet(255, 255, 255, 0);      // Alt ağ maskesi
+IPAddress dns(8, 8, 8, 8);               // DNS sunucusu (Google DNS)
+
+// UDP Ayarları - İki ayrı port kullanımı
+WiFiUDP udpSensor;  // Sensör verilerini göndermek için
+WiFiUDP udpPWM;     // PWM komutlarını almak için
+const char* guiIP = "192.168.152.194";  // GUI bilgisayarının IP adresi (kullanıcının IP'si)
+const int sensorPort = 4210;  // Sensör verilerini GUI'ye gönderme portu
+const int pwmPort = 4211;     // PWM komutlarını alma portu
+
+// Web Sunucu Ayarları
+ESP8266WebServer server(80);  // HTTP sunucu portu 80
+bool webServerActive = false;
+unsigned long lastWebUpdate = 0;
+const unsigned long webUpdateInterval = 500; // Web arayüzü güncelleme aralığı (ms)
+
+// I2C Pinleri - NodeMCU standart I2C pinleri
+const int SDA_PIN = D2;  // GPIO4 (NodeMCU D2)
+const int SCL_PIN = D1;  // GPIO5 (NodeMCU D1)
+
+// GUI Uyumlu PWM Kontrol Sistemi
+const int GUI_PWM_PIN = D5;  // GPIO14 (NodeMCU D5 pini)
+const int GUI_PWM_RANGE = 1023;  // ESP8266 PWM range (0-1023)
+bool gui_pwm_active = false;
+int gui_pwm_frequency = 0;
+float gui_pwm_duty = 0.0;
+
+// Sensör nesneleri
+Adafruit_MLX90393 mlx90393 = Adafruit_MLX90393();
+Adafruit_MLX90614 mlx90614 = Adafruit_MLX90614();
+
+// Timing ayarları - Optimize edilmiş hız ayarları
+unsigned long lastSensorRead = 0;
+unsigned long lastTempRead = 0;
+unsigned long lastUDPSend = 0;
+const unsigned long magneticInterval = 25;   // 25ms = 40Hz (manyetik alan için daha hızlı)
+const unsigned long tempInterval = 500;     // 500ms = 2Hz (sıcaklık yavaş değişir)
+const unsigned long udpInterval = 25;       // 10ms = 100Hz (GUI için daha anlık)
+
+// WiFi değişkenleri
+int wifiStrength = 0;
+
+// Sensör durumları
+bool mlx90393_ready = false;
+bool mlx90614_ready = false;
+
+// Manyetik alan dönüşüm faktörü
+const float UT_TO_MT = 1000.0;
+
+// MANYETIK ALAN FILTRELEME SISTEMI KALDIRILDI
+// Doğrudan ölçüm değerleri kullanılacak
+
+// Cached sensor values
+float cached_magnetic_magnitude = 0.0;
+float cached_ambient_temp = -999.0;
+float cached_object_temp = -999.0;
+
+// Performance monitoring
+unsigned long lastReport = 0;
+unsigned long packetCount = 0;
+unsigned long totalBytes = 0;
+unsigned long failedReads = 0;
+
+// JSON document - ESP8266 için daha küçük
+StaticJsonDocument<200> doc;
+char jsonBuffer[256];
+
+// Gelişmiş I2C device kontrol fonksiyonu
+bool checkI2CDevice(uint8_t address, int retries = 3) {
+  for (int i = 0; i < retries; i++) {
+    Wire.beginTransmission(address);
+    uint8_t error = Wire.endTransmission();
+    if (error == 0) {
+      return true;
+    }
+    delay(100); // Her deneme arasında bekleme
+  }
+  return false;
+}
+
+void scanI2CDevices() {
+  Serial.println("\n=== DETAYLI I2C SENSÖR TARAMASI ===");
+  bool deviceFound = false;
+  
+  for (uint8_t addr = 1; addr < 127; addr++) {
+    if (checkI2CDevice(addr, 1)) {
+      Serial.printf("✓ I2C cihaz bulundu: 0x%02X", addr);
+      
+      // Bilinen cihazları tanı
+      if (addr == 0x18) Serial.print(" (MLX90393 - Manyetik Sensör)");
+      if (addr == 0x5A) Serial.print(" (MLX90614 - Sıcaklık Sensörü)");
+      
+      Serial.println();
+      deviceFound = true;
+    }
+  }
+  
+  if (!deviceFound) {
+    Serial.println("✗ Hiçbir I2C cihaz bulunamadı!");
+    Serial.println("Bağlantıları ve pull-up dirençlerini kontrol edin.");
+  }
+  
+  Serial.println("=====================================\n");
+}
+
+// I2C'yi güvenli şekilde yeniden başlat - ESP8266 versiyonu
+void restartI2C() {
+  Serial.println("I2C yeniden başlatılıyor...");
+  // ESP8266'da Wire.end() yok, doğrudan yeniden başlat
+  delay(500);
+  Wire.begin(SDA_PIN, SCL_PIN);
+  Wire.setClock(100000); // Sabit 100kHz hız
+  delay(500);
+}
+
+// Dosya sistemi işlevleri
+void initFileSystem() {
+  // Artık dosya sistemi kullanmıyoruz, HTML kod içinde gömülü
+  Serial.println("✓ Web arayüzü HTML içinde gömülü olarak hazır");
+}
+
+// Web sunucu işlevleri
+void handleRoot() {
+  String html = R"rawliteral(
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ESP8266 Sensör Kontrol Paneli</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { 
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; 
+            background: linear-gradient(135deg, #0f2027 0%, #203a43 50%, #2c5364 100%);
+            min-height: 100vh; padding: 20px; color: #333;
+        }
+        .container { 
+            max-width: 1200px; margin: 0 auto; 
+            background: rgba(25, 42, 86, 0.9); 
+            border-radius: 20px; padding: 30px; 
+            box-shadow: 0 20px 40px rgba(0,0,0,0.3);
+            color: #ffffff;
+        }
+        .header { 
+            text-align: center; margin-bottom: 30px; 
+            border-bottom: 3px solid #00bcd4; padding-bottom: 20px;
+        }
+        .header h1 { 
+            color: #00bcd4; font-size: 2.5em; margin-bottom: 10px;
+            text-shadow: 0 2px 10px rgba(0, 188, 212, 0.3);
+        }
+        .status { 
+            display: inline-block; padding: 8px 16px; 
+            background: #4CAF50; color: white; 
+            border-radius: 20px; font-weight: bold;
+            box-shadow: 0 3px 10px rgba(76, 175, 80, 0.3);
+        }
+        .grid { 
+            display: grid; 
+            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); 
+            gap: 25px; margin-bottom: 30px;
+        }
+        .card { 
+            background: rgba(35, 52, 96, 0.9); border-radius: 15px; 
+            padding: 25px; box-shadow: 0 8px 25px rgba(0,0,0,0.2);
+            border-left: 5px solid #00bcd4; transition: all 0.3s ease;
+            color: #ffffff;
+        }
+        .card:hover { 
+            transform: translateY(-5px); 
+            box-shadow: 0 15px 30px rgba(0, 188, 212, 0.3);
+        }
+        .card h3 { 
+            color: #00bcd4; margin-bottom: 15px; 
+            font-size: 1.4em; display: flex; align-items: center;
+            text-shadow: 0 2px 5px rgba(0, 188, 212, 0.2);
+        }
+        .sensor-value { 
+            font-size: 2.2em; font-weight: bold; 
+            color: #ffffff; margin: 10px 0;
+            text-shadow: 0 2px 5px rgba(0, 0, 0, 0.3);
+        }
+        .sensor-unit { 
+            font-size: 0.9em; color: #b3e5fc; 
+            margin-left: 5px;
+        }
+        .pwm-controls { 
+            background: linear-gradient(135deg, #1a2a6c 0%, #b21f1f 50%, #fdbb2d 100%);
+            border-left-color: #fdbb2d;
+        }
+        .input-group { 
+            margin: 15px 0; display: flex; 
+            align-items: center; gap: 10px;
+        }
+        .input-group label { 
+            min-width: 80px; font-weight: bold; 
+            color: #ffffff;
+        }
+        .input-group input { 
+            flex: 1; padding: 12px; border: 2px solid rgba(255, 255, 255, 0.2); 
+            border-radius: 8px; font-size: 16px;
+            transition: all 0.3s ease;
+            background: rgba(35, 52, 96, 0.8);
+            color: #ffffff;
+        }
+        .input-group input:focus { 
+            outline: none; border-color: #00bcd4; 
+            box-shadow: 0 0 15px rgba(0, 188, 212, 0.5);
+        }
+        .btn { 
+            padding: 12px 25px; border: none; 
+            border-radius: 8px; cursor: pointer; 
+            font-size: 16px; font-weight: bold; 
+            transition: all 0.3s ease; margin: 5px;
+            box-shadow: 0 4px 10px rgba(0, 0, 0, 0.3);
+        }
+        .btn-primary { 
+            background: #00bcd4; color: white; 
+        }
+        .btn-primary:hover { 
+            background: #00acc1; transform: translateY(-2px);
+            box-shadow: 0 8px 20px rgba(0, 188, 212, 0.5);
+        }
+        .btn-success { 
+            background: #4CAF50; color: white; 
+        }
+        .btn-success:hover { 
+            background: #43a047; transform: translateY(-2px);
+            box-shadow: 0 8px 20px rgba(76, 175, 80, 0.5);
+        }
+        .btn-danger { 
+            background: #f44336; color: white; 
+        }
+        .btn-danger:hover { 
+            background: #e53935; transform: translateY(-2px);
+            box-shadow: 0 8px 20px rgba(244, 67, 54, 0.5);
+        }
+        .status-indicator { 
+            display: inline-block; width: 12px; height: 12px; 
+            border-radius: 50%; margin-right: 8px;
+            box-shadow: 0 0 10px currentColor;
+        }
+        .status-active { background: #4CAF50; box-shadow: 0 0 10px #4CAF50; }
+        .status-inactive { background: #f44336; box-shadow: 0 0 10px #f44336; }
+        .info-grid { 
+            display: grid; 
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); 
+            gap: 15px; margin-top: 20px;
+        }
+        .info-item { 
+            background: rgba(25, 42, 86, 0.7); padding: 15px; 
+            border-radius: 10px; text-align: center;
+            box-shadow: 0 5px 15px rgba(0, 0, 0, 0.2);
+            border: 1px solid rgba(0, 188, 212, 0.2);
+            transition: all 0.3s ease;
+        }
+        .info-item:hover {
+            transform: translateY(-3px);
+            box-shadow: 0 8px 20px rgba(0, 188, 212, 0.3);
+            border-color: rgba(0, 188, 212, 0.5);
+        }
+        .info-label { 
+            font-size: 0.9em; color: #b3e5fc; 
+            margin-bottom: 5px;
+        }
+        .info-value { 
+            font-size: 1.2em; font-weight: bold; 
+            color: #ffffff;
+            text-shadow: 0 2px 5px rgba(0, 0, 0, 0.2);
+        }
+        /* Animasyonlar */
+        @keyframes pulse {
+            0% { transform: scale(1); }
+            50% { transform: scale(1.05); }
+            100% { transform: scale(1); }
+        }
+        
+        @keyframes glow {
+            0% { box-shadow: 0 0 5px rgba(0, 188, 212, 0.5); }
+            50% { box-shadow: 0 0 20px rgba(0, 188, 212, 0.8); }
+            100% { box-shadow: 0 0 5px rgba(0, 188, 212, 0.5); }
+        }
+        
+        /* Animasyonlu elementler */
+        .sensor-value {
+            animation: pulse 2s infinite ease-in-out;
+        }
+        
+        .status-active {
+            animation: glow 2s infinite ease-in-out;
+        }
+        
+        /* Responsive design */
+        @media (max-width: 768px) {
+            .container { 
+                padding: 15px; 
+                margin: 10px;
+                width: calc(100% - 20px);
+            }
+            .header h1 { font-size: 2em; }
+            .grid { grid-template-columns: 1fr; }
+            .input-group { 
+                flex-direction: column; 
+                align-items: stretch; 
+                margin: 20px 0;
+            }
+            .input-group label { min-width: auto; margin-bottom: 5px; }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>🌟 ESP8266 Sensör Kontrol Paneli</h1>
+            <div class="status" id="connectionStatus">Bağlanıyor...</div>
+        </div>
+        
+        <div class="grid">
+            <div class="card">
+                <h3>⚡ Manyetik Alan Sensörü</h3>
+                <div class="sensor-value" id="magneticValue">--</div>
+                <div class="sensor-unit">mT (miliTesla)</div>
+                <div class="info-grid">
+                    <div class="info-item">
+                        <div class="info-label">Durum</div>
+                        <div class="info-value" id="magneticStatus">Bekleniyor</div>
+                    </div>
+                </div>
+            </div>
+            
+            <div class="card">
+                <h3>🔥 Sıcaklık Sensörü</h3>
+                <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 15px;">
+                    <div>
+                        <div class="info-label">Ortam Sıcaklığı</div>
+                        <div class="sensor-value" id="ambientTemp">--</div>
+                        <div class="sensor-unit">°C</div>
+                    </div>
+                    <div>
+                        <div class="info-label">Nesne Sıcaklığı</div>
+                        <div class="sensor-value" id="objectTemp">--</div>
+                        <div class="sensor-unit">°C</div>
+                    </div>
+                </div>
+            </div>
+            
+            <div class="card pwm-controls">
+                <h3>🎛️ PWM Kontrol</h3>
+                <div class="info-item" style="margin-bottom: 20px;">
+                    <span class="status-indicator" id="pwmStatusIndicator"></span>
+                    <span id="pwmStatusText">PWM Kapalı</span>
+                </div>
+                
+                <div class="input-group">
+                    <label>Frekans:</label>
+                    <input type="number" id="frequencyInput" min="1" max="1000" value="100" placeholder="1-1000 Hz">
+                    <span style="color: #666;">Hz</span>
+                </div>
+                
+                <div class="input-group">
+                    <label>Duty:</label>
+                    <input type="number" id="dutyInput" min="0" max="100" step="0.1" value="50" placeholder="0-100%">
+                    <span style="color: #666;">%</span>
+                </div>
+                
+                <div style="text-align: center; margin-top: 20px;">
+                    <button class="btn btn-success" onclick="applyPWMSettings()">✅ Ayarları Uygula</button>
+                    <button class="btn btn-primary" onclick="startPWM()">▶ PWM Başlat</button>
+                    <button class="btn btn-danger" onclick="stopPWM()">⏹ PWM Durdur</button>
+                </div>
+                
+                <div class="info-grid" style="margin-top: 20px;">
+                    <div class="info-item">
+                        <div class="info-label">Aktif Frekans</div>
+                        <div class="info-value" id="activePWMFreq">-- Hz</div>
+                    </div>
+                    <div class="info-item">
+                        <div class="info-label">Aktif Duty</div>
+                        <div class="info-value" id="activePWMDuty">-- %</div>
+                    </div>
+                </div>
+            </div>
+        </div>
+        
+        <div class="card">
+            <h3>📡 Sistem Bilgileri</h3>
+            <div class="info-grid">
+                <div class="info-item">
+                    <div class="info-label">Coil ID</div>
+                    <div class="info-value" id="coilId">--</div>
+                </div>
+                <div class="info-item">
+                    <div class="info-label">WiFi Sinyal</div>
+                    <div class="info-value" id="wifiSignal">-- dBm</div>
+                </div>
+                <div class="info-item">
+                    <div class="info-label">Çalışma Süresi</div>
+                    <div class="info-value" id="uptime">--</div>
+                </div>
+                <div class="info-item">
+                    <div class="info-label">Son Güncelleme</div>
+                    <div class="info-value" id="lastUpdate">--</div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        let updateInterval;
+        let startTime = Date.now();
+        
+        function updateSensorData() {
+            fetch('/data')
+                .then(response => response.json())
+                .then(data => {
+                    // Bağlantı durumu
+                    document.getElementById('connectionStatus').textContent = 'Bağlı ✅';
+                    document.getElementById('connectionStatus').style.background = '#4CAF50';
+                    
+                    // Manyetik alan
+                    document.getElementById('magneticValue').textContent = 
+                        data.magnetic_magnitude ? data.magnetic_magnitude.toFixed(3) : '--';
+                    document.getElementById('magneticStatus').textContent = 
+                        data.magnetic_magnitude ? 'Aktif' : 'Veri Yok';
+                    
+                    // Sıcaklık
+                    document.getElementById('ambientTemp').textContent = 
+                        data.ambient_temp ? data.ambient_temp.toFixed(1) : '--';
+                    document.getElementById('objectTemp').textContent = 
+                        data.object_temp ? data.object_temp.toFixed(1) : '--';
+                    
+                    // PWM durumu
+                    const pwmActive = data.gui_pwm_active;
+                    const indicator = document.getElementById('pwmStatusIndicator');
+                    const statusText = document.getElementById('pwmStatusText');
+                    
+                    if (pwmActive) {
+                        indicator.className = 'status-indicator status-active';
+                        statusText.textContent = 'PWM Aktif';
+                    } else {
+                        indicator.className = 'status-indicator status-inactive';
+                        statusText.textContent = 'PWM Kapalı';
+                    }
+                    
+                    // PWM değerlerini güncelle ve input alanlarını da güncelle
+                    document.getElementById('activePWMFreq').textContent = 
+                        data.gui_pwm_frequency + ' Hz';
+                    document.getElementById('activePWMDuty').textContent = 
+                        data.gui_pwm_duty + ' %';
+                    
+                    // Input alanlarını da güncelle
+                    document.getElementById('frequencyInput').value = data.gui_pwm_frequency;
+                    document.getElementById('dutyInput').value = data.gui_pwm_duty;
+                    
+                    // Sistem bilgileri
+                    document.getElementById('coilId').textContent = data.coil_id || '--';
+                    document.getElementById('wifiSignal').textContent = 
+                        data.wifi_rssi ? data.wifi_rssi + ' dBm' : '--';
+                    
+                    // Çalışma süresi
+                    const uptime = Math.floor((Date.now() - startTime) / 1000);
+                    const hours = Math.floor(uptime / 3600);
+                    const minutes = Math.floor((uptime % 3600) / 60);
+                    const seconds = uptime % 60;
+                    document.getElementById('uptime').textContent = 
+                        hours.toString().padStart(2,'0') + ':' + minutes.toString().padStart(2,'0') + ':' + seconds.toString().padStart(2,'0');
+                    
+                    // Son güncelleme
+                    document.getElementById('lastUpdate').textContent = 
+                        new Date().toLocaleTimeString('tr-TR');
+                })
+                .catch(error => {
+                    console.error('Veri alınamadı:', error);
+                    document.getElementById('connectionStatus').textContent = 'Bağlantı Hatası ❌';
+                    document.getElementById('connectionStatus').style.background = '#f44336';
+                });
+        }
+        
+        function applyPWMSettings() {
+            const frequency = document.getElementById('frequencyInput').value;
+            const duty = document.getElementById('dutyInput').value;
+            
+            if (!frequency || !duty) {
+                alert('Lütfen frekans ve duty değerlerini girin!');
+                return;
+            }
+            
+            if (frequency < 1 || frequency > 1000) {
+                alert('Frekans 1-1000 Hz arasında olmalıdır!');
+                return;
+            }
+            
+            if (duty < 0 || duty > 100) {
+                alert('Duty cycle 0-100% arasında olmalıdır!');
+                return;
+            }
+            
+            fetch('/pwm?frequency=' + frequency + '&duty=' + duty)
+                .then(response => response.text())
+                .then(data => {
+                    alert('PWM ayarları güncellendi: ' + data);
+                    updateSensorData();
+                })
+                .catch(error => {
+                    alert('PWM ayarları güncellenemedi: ' + error);
+                });
+        }
+        
+        function startPWM() {
+            fetch('/pwm?start=1')
+                .then(response => response.text())
+                .then(data => {
+                    alert('PWM başlatıldı: ' + data);
+                    updateSensorData();
+                })
+                .catch(error => {
+                    alert('PWM başlatılamadı: ' + error);
+                });
+        }
+        
+        function stopPWM() {
+            fetch('/pwm?stop=1')
+                .then(response => response.text())
+                .then(data => {
+                    alert('PWM durduruldu: ' + data);
+                    updateSensorData();
+                })
+                .catch(error => {
+                    alert('PWM durdurulamadı: ' + error);
+                });
+        }
+        
+        // Sayfa yüklendiğinde başlat
+        window.onload = function() {
+            updateSensorData();
+            updateInterval = setInterval(updateSensorData, 1000);
+        };
+        
+        // Sayfa kapatılırken temizle
+        window.onbeforeunload = function() {
+            if (updateInterval) {
+                clearInterval(updateInterval);
+            }
+        };
+    </script>
+</body>
+</html>
+)rawliteral";
+  
+  server.send(200, "text/html", html);
+}
+
+void handleCSS() {
+  // CSS artık HTML içinde gömülü olduğu için bu fonksiyon gereksiz
+  server.send(404, "text/plain", "CSS dosyası artık HTML içinde gömülü!");
+}
+
+void handleJS() {
+  // JavaScript artık HTML içinde gömülü olduğu için bu fonksiyon gereksiz
+  server.send(404, "text/plain", "JavaScript dosyası artık HTML içinde gömülü!");
+}
+
+void handleNotFound() {
+  server.send(404, "text/plain", "Sayfa bulunamadı!");
+}
+
+void handleSensorData() {
+  // JSON belgesini oluştur
+  StaticJsonDocument<200> webDoc;
+  webDoc["timestamp"] = millis();
+  webDoc["coil_id"] = COIL_ID;
+  webDoc["magnetic_magnitude"] = cached_magnetic_magnitude;
+  webDoc["ambient_temp"] = cached_ambient_temp != -999.0 ? cached_ambient_temp : 0;
+  webDoc["object_temp"] = cached_object_temp != -999.0 ? cached_object_temp : 0;
+  webDoc["gui_pwm_active"] = gui_pwm_active;
+  webDoc["gui_pwm_frequency"] = gui_pwm_frequency;
+  webDoc["gui_pwm_duty"] = gui_pwm_duty;
+  webDoc["wifi_rssi"] = wifiStrength;
+  
+  // Debug: JSON'da gönderilen duty değerini logla
+  Serial.printf("JSON'da gönderilen duty değeri: %.2f%%\n", gui_pwm_duty);
+  
+  // JSON'ı string olarak gönder
+  String jsonString;
+  serializeJson(webDoc, jsonString);
+  server.send(200, "application/json", jsonString);
+}
+
+void handlePWMControl() {
+  String message = "PWM ayarları güncellendi";
+  bool updatePWM = false;
+  
+  if (server.hasArg("start")) {
+    gui_pwm_active = true;
+    updatePWM = true;
+    message = "PWM başlatıldı";
+    Serial.printf("PWM başlatma komutu alındı - Mevcut ayarlar: Frekans=%dHz, Duty=%.2f%%\n", 
+                  gui_pwm_frequency, gui_pwm_duty);
+  }
+  
+  if (server.hasArg("stop")) {
+    gui_pwm_active = false;
+    analogWrite(GUI_PWM_PIN, 0);
+    message = "PWM durduruldu";
+  }
+  
+  if (server.hasArg("frequency")) {
+    int freq = server.arg("frequency").toInt();
+    if (freq >= 1 && freq <= 1000) {
+      gui_pwm_frequency = freq;
+      updatePWM = true;
+      message = "Frekans güncellendi: " + String(freq) + " Hz";
+    }
+  }
+  
+  if (server.hasArg("duty")) {
+    float duty = server.arg("duty").toFloat();
+    Serial.printf("Web'den gelen duty değeri: %.2f\n", duty);
+    if (duty >= 0.0 && duty <= 100.0) {
+      gui_pwm_duty = duty;
+      updatePWM = true;
+      message = "Duty cycle güncellendi: " + String(duty) + "%";
+      Serial.printf("gui_pwm_duty değişkeni güncellendi: %.2f%%\n", gui_pwm_duty);
+    } else {
+      message = "Hata: Duty cycle 0-100 arasında olmalı!";
+      Serial.printf("Geçersiz duty değeri: %.2f\n", duty);
+    }
+  }
+  
+  if (updatePWM && gui_pwm_active) {
+    analogWriteFreq(gui_pwm_frequency);
+    int pwmValue = (int)((gui_pwm_duty * GUI_PWM_RANGE) / 100.0);
+    analogWrite(GUI_PWM_PIN, pwmValue);
+    Serial.printf("PWM güncellendi - Frekans: %dHz, Duty: %.2f%%, PWM Değer: %d/%d\n", 
+                  gui_pwm_frequency, gui_pwm_duty, pwmValue, GUI_PWM_RANGE);
+  }
+  
+  server.send(200, "text/plain", message);
+}
+
+void initWebServer() {
+  // Web sunucu rotalarını tanımla
+  server.on("/", handleRoot);
+  server.on("/style.css", handleCSS);
+  server.on("/script.js", handleJS);
+  server.on("/data", handleSensorData);
+  server.on("/pwm", handlePWMControl);
+  server.onNotFound(handleNotFound);
+  
+  // Sunucuyu başlat
+  server.begin();
+  webServerActive = true;
+  Serial.println("✓ Web sunucu başlatıldı");
+  Serial.print("Web arayüzü: http://");
+  Serial.println(WiFi.localIP());
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(2000); // Daha uzun başlangıç bekleme süresi
+  
+  Serial.println("\n=== ESP8266 NodeMCU I2C SENSÖR SISTEMI ===");
+  Serial.println("Başlatılıyor...\n");
+  
+  // Dosya sistemini başlat
+  initFileSystem();
+  
+  // I2C başlat - sabit hız ayarı
+  Wire.begin(SDA_PIN, SCL_PIN);
+  Wire.setClock(100000); // Sabit 100kHz hız
+  delay(1000);
+  
+  Serial.printf("I2C pinleri: SDA=D2(GPIO%d), SCL=D1(GPIO%d)\n", SDA_PIN, SCL_PIN);
+  Serial.printf("GUI PWM pini: D5(GPIO%d)\n", GUI_PWM_PIN);
+  Serial.println("I2C hız: 100kHz (sabit hız)");
+  
+  // I2C cihazları tara
+  scanI2CDevices();
+  
+  // MLX90614 (Sıcaklık Sensörü) Başlatma
+  Serial.println("=== MLX90614 SICAKLIK SENSÖRÜ ===");
+  mlx90614_ready = false;
+  
+  for (int attempt = 0; attempt < 3; attempt++) {
+    Serial.printf("Deneme %d/3: ", attempt + 1);
+    
+    // I2C cihazını kontrol et
+    if (!checkI2CDevice(0x5A, 3)) {
+      Serial.println("✗ I2C'de MLX90614 bulunamadı");
+      delay(1000);
+      continue;
+    }
+    
+    // Sensörü başlat
+    if (mlx90614.begin()) {
+      Serial.print("Başlatıldı, test ediliyor... ");
+      delay(500);
+      
+      // Test okuma
+      float testTemp = mlx90614.readAmbientTempC();
+      if (!isnan(testTemp) && testTemp > -50 && testTemp < 100) {
+        Serial.printf("✓ BAŞARILI! Test sıcaklık: %.2f°C\n", testTemp);
+        mlx90614_ready = true;
+        break;
+      } else {
+        Serial.printf("✗ Geçersiz okuma: %.2f\n", testTemp);
+      }
+    } else {
+      Serial.println("✗ Başlatma başarısız");
+    }
+    
+    if (attempt < 2) {
+      Serial.println("I2C yeniden başlatılıyor...");
+      restartI2C();
+    }
+  }
+  
+  if (!mlx90614_ready) {
+    Serial.println("⚠ MLX90614 başlatılamadı - NULL değerler gönderilecek");
+  }
+  
+  delay(1000);
+  
+  // MLX90393 (Manyetik Sensör) Başlatma
+  Serial.println("\n=== MLX90393 MANYETIK SENSÖR ===");
+  mlx90393_ready = false;
+  
+  for (int attempt = 0; attempt < 3; attempt++) {
+    Serial.printf("Deneme %d/3: ", attempt + 1);
+    
+    // I2C cihazını kontrol et
+    if (!checkI2CDevice(0x18, 3)) {
+      Serial.println("✗ I2C'de MLX90393 bulunamadı");
+      delay(1000);
+      continue;
+    }
+    
+    // Sensörü başlat
+    if (mlx90393.begin_I2C(0x18)) {
+      Serial.print("Başlatıldı, ayarlanıyor... ");
+      
+      // Konservatif ayarlar
+      mlx90393.setGain(MLX90393_GAIN_2_5X); // Daha düşük gain
+      mlx90393.setResolution(MLX90393_X, MLX90393_RES_16);
+      mlx90393.setResolution(MLX90393_Y, MLX90393_RES_16);
+      mlx90393.setResolution(MLX90393_Z, MLX90393_RES_16);
+      mlx90393.setOversampling(MLX90393_OSR_1); // Daha yavaş
+      // Filtre kaldırıldı
+      
+      delay(500);
+      
+      // Test okuma
+      float x, y, z;
+      if (mlx90393.readData(&x, &y, &z)) {
+        float magnitude = sqrt(x*x + y*y + z*z) / UT_TO_MT;
+        Serial.printf("✓ BAŞARILI! Manyetik alan: %.3fmT\n", magnitude);
+        mlx90393_ready = true;
+        break;
+      } else {
+        Serial.println("✗ Test okuma başarısız");
+      }
+    } else {
+      Serial.println("✗ Başlatma başarısız");
+    }
+    
+    if (attempt < 2) {
+      Serial.println("I2C yeniden başlatılıyor...");
+      restartI2C();
+    }
+  }
+  
+  if (!mlx90393_ready) {
+    Serial.println("⚠ MLX90393 başlatılamadı");
+  }
+  
+  // I2C hızı zaten 100kHz olarak ayarlandı
+  delay(200);
+  Serial.println("\nI2C hız 100kHz olarak sabit ayarlandı");
+  
+  // GUI ile uyumlu PWM pin ayarları
+   pinMode(GUI_PWM_PIN, OUTPUT);
+   digitalWrite(GUI_PWM_PIN, LOW);
+   Serial.println("GUI ile uyumlu çalışma modu aktif");
+   Serial.printf("GUI PWM Pini: D5 (GPIO%d)\n", GUI_PWM_PIN);
+  
+  // WiFi bağlantısı - sürekli tekrar deneme mekanizması
+  Serial.println("\n=== WiFi BAĞLANTI SISTEMI ===");
+  Serial.printf("SSID: %s\n", WIFI_SSID);
+  Serial.println("WiFi bağlantısı kuruluyor...");
+  
+  Serial.println("Sabit IP adresi yapılandırılıyor: 192.168.244.200");
+  WiFi.config(staticIP, gateway, subnet, dns);
+  
+  // WiFi bağlantısı kurulana kadar sürekli dene
+  while (WiFi.status() != WL_CONNECTED) {
+    WiFi.begin(WIFI_SSID, WIFI_PSWD);
+    Serial.print("Bağlanıyor");
+    
+    // 15 saniye boyunca bağlantı kontrolü (ESP8266 daha yavaş)
+    for (int i = 0; i < 15; i++) {
+      delay(1000);
+      Serial.print(".");
+      
+      if (WiFi.status() == WL_CONNECTED) {
+        break;
+      }
+    }
+    
+    if (WiFi.status() == WL_CONNECTED) {
+      Serial.println("\n✓ WiFi bağlandı!");
+      Serial.printf("IP Adresi: %s\n", WiFi.localIP().toString().c_str());
+      Serial.printf("Sinyal Gücü: %d dBm\n", WiFi.RSSI());
+      
+      // UDP portlarını başlat
+      udpSensor.begin(sensorPort);  // Sensör verilerini göndermek için
+      udpPWM.begin(pwmPort);        // PWM komutlarını almak için
+      Serial.printf("UDP Sensör Port %d'de başlatıldı\n", sensorPort);
+      Serial.printf("UDP PWM Port %d'de dinleniyor\n", pwmPort);
+      Serial.printf("Sensör veri gönderim: %s:%d (doğrudan bağlantı)\n\n", guiIP, sensorPort);
+      
+      // Web sunucuyu başlat
+      initWebServer();
+      break;
+    } else {
+      Serial.println("\n✗ Bağlantı başarısız! 2 saniye sonra tekrar denenecek...");
+      WiFi.disconnect();
+      delay(2000);
+    }
+  }
+  
+  // Manyetik buffer sıfırlama kodu kaldırıldı - filtreleme yapılmıyor
+  
+  lastReport = millis();
+  
+  // OTA başlat
+  Serial.println("\n=== OTA GÜNCELLEME SISTEMI ===\n");
+  ArduinoOTA.setHostname("ESP8266_COIL");  // Arduino IDE'de göreceğin isim
+  
+  // OTA olaylarını izleme
+  ArduinoOTA.onStart([]() {
+    String type;
+    if (ArduinoOTA.getCommand() == U_FLASH) {
+      type = "sketch";
+    } else { // U_FS
+      type = "filesystem";
+    }
+    Serial.println("OTA Başlıyor: " + type);
+  });
+  
+  ArduinoOTA.onEnd([]() {
+    Serial.println("\n✓ OTA Tamamlandı!");
+  });
+  
+  ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
+    Serial.printf("İlerleme: %u%%\r", (progress / (total / 100)));
+  });
+  
+  ArduinoOTA.onError([](ota_error_t error) {
+    Serial.printf("OTA Hata[%u]: ", error);
+    if (error == OTA_AUTH_ERROR) {
+      Serial.println("Yetkilendirme Hatası");
+    } else if (error == OTA_BEGIN_ERROR) {
+      Serial.println("Başlangıç Hatası");
+    } else if (error == OTA_CONNECT_ERROR) {
+      Serial.println("Bağlantı Hatası");
+    } else if (error == OTA_RECEIVE_ERROR) {
+      Serial.println("Veri Alma Hatası");
+    } else if (error == OTA_END_ERROR) {
+      Serial.println("Sonlandırma Hatası");
+    }
+  });
+  
+  ArduinoOTA.begin();
+  Serial.println("✓ OTA Hazır! IP: " + WiFi.localIP().toString());
+  Serial.println("Arduino IDE'de Araçlar > Port menüsünden ağ portunu seçin");
+  Serial.println("============================\n");
+  
+  // Final durum raporu
+  Serial.println("=== SISTEM DURUM RAPORU ===");
+  Serial.printf("MLX90393 (Manyetik): %s\n", mlx90393_ready ? "✓ HAZIR" : "✗ BAĞLI DEĞIL");
+  Serial.printf("MLX90614 (Sıcaklık): %s\n", mlx90614_ready ? "✓ HAZIR" : "✗ BAĞLI DEĞIL");
+  Serial.printf("WiFi: %s\n", WiFi.status() == WL_CONNECTED ? "✓ BAĞLI" : "✗ BAĞLI DEĞIL");
+  Serial.printf("OTA: %s\n", WiFi.status() == WL_CONNECTED ? "✓ HAZIR" : "✗ BAĞLI DEĞIL");
+  Serial.println("============================\n");
+  
+  if (mlx90393_ready || mlx90614_ready) {
+    Serial.println("✓ Sistem hazır! ESP8266 optimize ayarlar:");
+    Serial.println("- Manyetik okuma: 40Hz");
+    Serial.println("- Sıcaklık okuma: 2Hz");
+    Serial.println("- UDP gönderim: 100Hz");
+  } else {
+    Serial.println("⚠ Hiçbir sensör çalışmıyor - sadece PWM kontrol aktif");
+  }
+}
+
+// Filtreleme fonksiyonları kaldırıldı - doğrudan ölçüm değerleri kullanılacak
+
+void readMagneticField() {
+  if (!mlx90393_ready) return;
+  
+  float x_ut, y_ut, z_ut;
+  
+  // Optimize edilmiş okuma - tek deneme ile hızlı okuma
+  if (mlx90393.readData(&x_ut, &y_ut, &z_ut)) {
+    // Doğrudan hesaplama - ara değişkenler olmadan
+    cached_magnetic_magnitude = sqrt(
+      (x_ut / UT_TO_MT) * (x_ut / UT_TO_MT) + 
+      (y_ut / UT_TO_MT) * (y_ut / UT_TO_MT) + 
+      (z_ut / UT_TO_MT) * (z_ut / UT_TO_MT)
+    );
+    return; // Başarılı okuma
+  }
+  
+  // Sadece bir kez daha dene - daha kısa bekleme ile
+  delay(5); // Minimal bekleme
+  if (mlx90393.readData(&x_ut, &y_ut, &z_ut)) {
+    cached_magnetic_magnitude = sqrt(
+      (x_ut / UT_TO_MT) * (x_ut / UT_TO_MT) + 
+      (y_ut / UT_TO_MT) * (y_ut / UT_TO_MT) + 
+      (z_ut / UT_TO_MT) * (z_ut / UT_TO_MT)
+    );
+    return;
+  }
+  
+  failedReads++;
+}
+
+void readTemperature() {
+  if (!mlx90614_ready) {
+    cached_ambient_temp = -999.0;
+    cached_object_temp = -999.0;
+    return;
+  }
+  
+  // Ultra optimize edilmiş okuma - minimum gecikme
+  float ambient = mlx90614.readAmbientTempC();
+  float object = mlx90614.readObjectTempC();
+  
+  // Hızlı veri doğrulama
+  if (!isnan(ambient) && !isnan(object) && 
+      ambient > -50 && ambient < 100 && 
+      object > -50 && object < 200) {
+    cached_ambient_temp = ambient;
+    cached_object_temp = object;
+    return; // Başarılı okuma
+  }
+  
+  // Tek retry ile ultra hızlı hata kurtarma - minimum gecikme
+  delay(5);
+  ambient = mlx90614.readAmbientTempC();
+  object = mlx90614.readObjectTempC();
+  
+  // Son kontrol
+  if (!isnan(ambient) && !isnan(object) && 
+      ambient > -50 && ambient < 100 && 
+      object > -50 && object < 200) {
+    cached_ambient_temp = ambient;
+    cached_object_temp = object;
+    return;
+  }
+  
+  // Başarısız okuma
+  cached_ambient_temp = -999.0;
+  cached_object_temp = -999.0;
+  failedReads++;
+}
+
+void sendUDPData() {
+  // Hızlı WiFi kontrolü - bağlantı yoksa gönderme
+  if (WiFi.status() != WL_CONNECTED) {
+    return;
+  }
+  
+  // JSON belgesini temizle ve minimum gerekli verileri ekle
+  doc.clear();
+  doc["timestamp"] = millis();
+  doc["coil_id"] = COIL_ID;
+  doc["magnetic_magnitude"] = round(cached_magnetic_magnitude * 1000) / 1000.0;
+  
+  // Sıcaklık verilerini optimize edilmiş şekilde ekle
+  if (cached_ambient_temp != -999.0) {
+    doc["ambient_temp"] = round(cached_ambient_temp * 100) / 100.0;
+  } else {
+    doc["ambient_temp"] = nullptr;
+  }
+  
+  if (cached_object_temp != -999.0) {
+    doc["object_temp"] = round(cached_object_temp * 100) / 100.0;
+  } else {
+    doc["object_temp"] = nullptr;
+  }
+  
+  // GUI ile uyumlu veri gönderimi - sadece gerekli bilgileri ekle
+  doc["gui_pwm_active"] = gui_pwm_active;
+  doc["gui_pwm_frequency"] = gui_pwm_frequency;
+  doc["gui_pwm_duty"] = gui_pwm_duty;
+  
+  // WiFi performans bilgilerini ekle - gerçek zamanlı performans için kritik
+  doc["wifi_rssi"] = wifiStrength;
+  doc["udp_interval"] = udpInterval;
+  
+  // JSON'ı hızlıca serileştir
+  size_t len = serializeJson(doc, jsonBuffer);
+  
+  // Debug çıktılarını kaldırarak performansı artır
+  // Serial.printf("[DEBUG] Sending sensor data to %s:%d\n", guiIP, sensorPort);
+  // Serial.printf("[DEBUG] JSON: %s\n", jsonBuffer);
+  
+  // UDP paket gönderimi - optimize edilmiş
+  udpSensor.beginPacket(guiIP, sensorPort);
+  udpSensor.write((uint8_t*)jsonBuffer, len);
+  bool success = udpSensor.endPacket();
+  
+  // Debug çıktılarını kaldırarak performansı artır
+  // if (success) {
+  //   Serial.printf("[DEBUG] UDP packet sent successfully (%d bytes)\n", len);
+  // } else {
+  //   Serial.println("[DEBUG] UDP packet send failed!");
+  // }
+  
+  // İstatistik güncelleme
+  packetCount++;
+  totalBytes += len;
+}
+
+void processUDPCommands() {
+  int packetSize = udpPWM.parsePacket();
+  if (packetSize) {
+    char packetBuffer[255];
+    int len = udpPWM.read(packetBuffer, 255);
+    if (len > 0) {
+      packetBuffer[len] = 0;
+      
+      StaticJsonDocument<200> cmdDoc;
+      DeserializationError error = deserializeJson(cmdDoc, packetBuffer);
+      if (error == DeserializationError::Ok) {
+        // GUI'den komut alındı
+        Serial.println("GUI'den komut alındı");
+        Serial.println(packetBuffer);
+        
+        // Komutun hangi coil_id için olduğunu kontrol et
+        if (cmdDoc.containsKey("coil_id")) {
+          int targetCoilId = cmdDoc["coil_id"];
+          
+          // Bu ESP32'nin COIL_ID'si ile eşleşmiyorsa komutu işleme
+          if (targetCoilId != COIL_ID) {
+            Serial.printf("Bu komut Coil ID %d için, bu cihaz Coil ID %d. Komut yok sayılıyor.\n", 
+                         targetCoilId, COIL_ID);
+            return;
+          }
+          
+          Serial.printf("Bu cihaz için komut alındı (Coil ID %d)\n", COIL_ID);
+        } else {
+          // coil_id belirtilmemişse, eski komut formatı olabilir, işlemeye devam et
+          Serial.println("Uyarı: Komutta coil_id belirtilmemiş, tüm cihazlar işleyecek");
+        }
+         
+        // PWM başlatma komutu (hem gui_pwm_start hem de pwm_start formatını destekle)
+        if (cmdDoc["gui_pwm_start"] == true || cmdDoc["pwm_start"] == true) {
+          Serial.printf("UDP PWM başlatma komutu alındı - Mevcut duty: %.2f%%\n", gui_pwm_duty);
+          if (!gui_pwm_active) {
+            analogWriteFreq(gui_pwm_frequency);
+            int pwmValue = (int)((gui_pwm_duty * GUI_PWM_RANGE) / 100.0);
+            analogWrite(GUI_PWM_PIN, pwmValue);
+            gui_pwm_active = true;
+            Serial.printf("PWM başlatıldı - Frekans: %dHz, Duty: %.2f%% (PWM Değer: %d/%d)\n", 
+                        gui_pwm_frequency, gui_pwm_duty, pwmValue, GUI_PWM_RANGE);
+          } else {
+            Serial.println("PWM zaten çalışıyor");
+          }
+        }
+         
+        // PWM durdurma komutu (hem gui_pwm_stop hem de pwm_stop formatını destekle)
+        else if (cmdDoc["gui_pwm_stop"] == true || cmdDoc["pwm_stop"] == true) {
+          if (gui_pwm_active) {
+            analogWrite(GUI_PWM_PIN, 0);
+            gui_pwm_active = false;
+            Serial.println("PWM durduruldu");
+          }
+        }
+         
+        // PWM frekans ayarı (hem gui_pwm_frequency hem de pwm_freq formatını destekle)
+        if (cmdDoc["gui_pwm_frequency"].is<int>() || cmdDoc["pwm_freq"].is<int>()) {
+          int freq = 0;
+          if (cmdDoc["gui_pwm_frequency"].is<int>()) {
+            freq = cmdDoc["gui_pwm_frequency"];
+          } else if (cmdDoc["pwm_freq"].is<int>()) {
+            freq = cmdDoc["pwm_freq"];
+          }
+          
+          if (freq >= 1 && freq <= 1000) {  // ESP8266 PWM frekans sınırı
+            gui_pwm_frequency = freq;
+            if (gui_pwm_active) {
+              analogWriteFreq(gui_pwm_frequency);
+              int pwmValue = (int)((gui_pwm_duty * GUI_PWM_RANGE) / 100.0);
+              analogWrite(GUI_PWM_PIN, pwmValue);
+              Serial.printf("PWM Frekans güncellendi: %d Hz (Duty: %.1f%%, PWM Değer: %d/%d)\n", 
+                          freq, gui_pwm_duty, pwmValue, GUI_PWM_RANGE);
+            } else {
+              Serial.printf("PWM Frekans ayarlandı: %d Hz (PWM başlatıldığında uygulanacak)\n", freq);
+            }
+          } else {
+            Serial.printf("Geçersiz frekans: %dHz. 1-1000Hz arasında olmalı.\n", freq);
+          }
+        }
+         
+        // PWM duty cycle ayarı (hem gui_pwm_duty hem de pwm_duty formatını destekle)
+        if (cmdDoc["gui_pwm_duty"].is<float>() || cmdDoc["pwm_duty"].is<float>() || 
+            cmdDoc["gui_pwm_duty"].is<int>() || cmdDoc["pwm_duty"].is<int>()) {
+          float duty = 0.0;
+          
+          // Float veya int olarak gelen duty değerini al
+          if (cmdDoc["gui_pwm_duty"].is<float>()) {
+            duty = cmdDoc["gui_pwm_duty"].as<float>();
+          } else if (cmdDoc["gui_pwm_duty"].is<int>()) {
+            duty = (float)cmdDoc["gui_pwm_duty"].as<int>();
+          } else if (cmdDoc["pwm_duty"].is<float>()) {
+            duty = cmdDoc["pwm_duty"].as<float>();
+          } else if (cmdDoc["pwm_duty"].is<int>()) {
+            duty = (float)cmdDoc["pwm_duty"].as<int>();
+          }
+          
+          // Duty değerini sınırla (gereksiz bölme işlemi kaldırıldı)
+          if (duty >= 0.0 && duty <= 100.0) {
+            gui_pwm_duty = duty;
+            if (gui_pwm_active) {
+              int pwmValue = (int)((duty * GUI_PWM_RANGE) / 100.0);
+              analogWrite(GUI_PWM_PIN, pwmValue);
+              Serial.printf("PWM Duty: %.1f%% (PWM Değer: %d/%d)\n", duty, pwmValue, GUI_PWM_RANGE);
+            } else {
+              Serial.printf("PWM Duty ayarlandı: %.1f%% (PWM başlatıldığında uygulanacak)\n", duty);
+            }
+          } else {
+            Serial.printf("Geçersiz duty cycle: %.1f%%. 0-100 arasında olmalı.\n", duty);
+          }
+        }
+         
+        // PWM durum kontrolü (hem check_gui_pwm hem de check_pwm formatını destekle)
+        if (cmdDoc["check_gui_pwm"] == true || cmdDoc["check_pwm"] == true) {
+          Serial.println("\n=== PWM DURUM KONTROLÜ ===\n");
+          Serial.printf("PWM Durumu: %s\n", gui_pwm_active ? "✓ ÇALIŞIYOR" : "✗ DURDURULDU");
+          Serial.printf("PWM Aktif: %s\n", gui_pwm_active ? "Evet" : "Hayır");
+          Serial.printf("Frekans: %d Hz\n", gui_pwm_frequency);
+          Serial.printf("Duty Cycle: %.1f%%\n", gui_pwm_duty);
+          if (gui_pwm_active) {
+            int expectedPwmValue = (int)((gui_pwm_duty * GUI_PWM_RANGE) / 100.0);
+            Serial.printf("PWM Değeri: %d/%d\n", expectedPwmValue, GUI_PWM_RANGE);
+            Serial.printf("Çıkış Voltajı: %.2fV\n", (3.3 * gui_pwm_duty / 100.0));
+          }
+          Serial.println("============================\n");
+        }
+        
+        // UDP aralığı bilgisi (sadece bilgi amaçlı)
+        if (cmdDoc["udp_interval"].is<int>()) {
+          int interval = cmdDoc["udp_interval"];
+          if (interval >= 50 && interval <= 2000) {
+            Serial.printf("UDP aralığı bilgisi alındı: %dms (sabit 25ms kullanılıyor)\n", interval);
+          }
+        }
+        
+        if (cmdDoc["check_sensors"] == true) {
+          Serial.println("\n=== SENSÖR DURUM KONTROLÜ ===\n");
+          Serial.printf("MLX90393 (Manyetik): %s\n", mlx90393_ready ? "✓ ÇALIŞIYOR" : "✗ BAĞLI DEĞIL");
+          Serial.printf("MLX90614 (Sıcaklık): %s\n", mlx90614_ready ? "✓ ÇALIŞIYOR" : "✗ BAĞLI DEĞIL");
+          if (mlx90614_ready) {
+            Serial.printf("Son sıcaklık: %.1f°C / %.1f°C\n", cached_ambient_temp, cached_object_temp);
+          }
+          if (mlx90393_ready) {
+            Serial.printf("Son manyetik alan: %.3fmT\n", cached_magnetic_magnitude);
+          }
+          Serial.println("===============================\n");
+        }
+        
+        if (cmdDoc["restart_i2c"] == true) {
+          Serial.println("I2C yeniden başlatılıyor...");
+          restartI2C();
+          scanI2CDevices();
+        }
+      }
+    }
+  }
+}
+
+// WiFi sinyal gücü ölçümü
+void updateWiFiStrength() {
+  // WiFi sinyal gücünü ölç
+  wifiStrength = WiFi.RSSI();
+  
+  // Sinyal gücünü raporla
+  if (wifiStrength > -50) {
+    Serial.println("[WiFi] Mükemmel sinyal gücü");
+  } else if (wifiStrength > -60) {
+    Serial.println("[WiFi] İyi sinyal gücü");
+  } else if (wifiStrength > -70) {
+    Serial.println("[WiFi] Orta sinyal gücü");
+  } else if (wifiStrength > -80) {
+    Serial.println("[WiFi] Zayıf sinyal gücü");
+  } else {
+    Serial.println("[WiFi] Çok zayıf sinyal gücü");
+  }
+}
+
+void printPerformanceStats() {
+  unsigned long now = millis();
+  if (now - lastReport >= 5000) { // 5 saniye rapor
+    Serial.printf("\n--- PERFORMANS RAPORU ---\n");
+    Serial.printf("UDP: %.1f paket/5s, %.0f byte/5s\n", (float)packetCount, (float)totalBytes);
+    Serial.printf("Başarısız okuma: %lu\n", failedReads);
+    
+    Serial.printf("WiFi: %s (Sinyal: %ddBm)\n", 
+                  WiFi.status() == WL_CONNECTED ? "Bağlı" : "Bağlı Değil", wifiStrength);
+    Serial.printf("UDP Aralığı: %lums (sabit)\n", udpInterval);
+    
+    if (mlx90393_ready) {
+      Serial.printf("Manyetik: %.3fmT\n", cached_magnetic_magnitude);
+    } else {
+      Serial.println("Manyetik: Sensör Yok");
+    }
+    
+    if (mlx90614_ready) {
+      Serial.printf("Sıcaklık: %.1f°C / %.1f°C\n", cached_ambient_temp, cached_object_temp);
+    } else {
+      Serial.println("Sıcaklık: Sensör Yok");
+    }
+    
+    // ESP8266 bellek durumu
+    Serial.printf("Serbest Heap: %u bytes\n", ESP.getFreeHeap());
+    
+    Serial.println("------------------------\n");
+    
+    packetCount = 0;
+    totalBytes = 0;
+    lastReport = now;
+  }
+}
+
+void loop() {
+  // OTA güncellemelerini kontrol et
+  ArduinoOTA.handle();
+  
+  // Web sunucuyu işle
+  if (webServerActive) {
+    server.handleClient();
+  }
+  
+  unsigned long currentTime = millis();
+  
+  // WiFi bağlantı kontrolü - daha az sıklıkta
+  static unsigned long lastWiFiCheck = 0;
+  if (currentTime - lastWiFiCheck >= 5000) { // Her 5 saniyede kontrol et - daha az sıklıkta
+    lastWiFiCheck = currentTime;
+    
+    if (WiFi.status() != WL_CONNECTED) {
+      // Sessiz yeniden bağlanma - debug çıktıları kaldırıldı
+      WiFi.disconnect();
+      
+      // Sabit IP adresini yeniden yapılandır
+      WiFi.config(staticIP, gateway, subnet, dns);
+      
+      WiFi.begin(WIFI_SSID, WIFI_PSWD);
+    }
+  }
+  
+  // UDP komutlarını işle - her döngüde kontrol et
+  processUDPCommands();
+  
+  // WiFi sinyal gücünü güncelle - daha az sıklıkta
+  if (currentTime - lastReport >= 5000) {
+    wifiStrength = WiFi.RSSI(); // Sessiz güncelleme
+  }
+  
+  // Manyetik alan ölçümü - 40Hz (25ms) - Gerçek zamanlı performans için optimize
+  if (currentTime - lastSensorRead >= magneticInterval) {
+    lastSensorRead = currentTime;
+    readMagneticField(); // Debug çıktıları kaldırıldı
+  }
+  
+  // Sıcaklık ölçümü - 2Hz (500ms) - Değişim hızı düşük
+  if (currentTime - lastTempRead >= tempInterval) {
+    lastTempRead = currentTime;
+    readTemperature(); // Debug çıktıları kaldırıldı
+  }
+  
+  // UDP veri gönderimi - 100Hz (10ms) - Gerçek zamanlı performans için optimize
+  if (currentTime - lastUDPSend >= udpInterval) {
+    lastUDPSend = currentTime;
+    sendUDPData(); // Debug çıktıları kaldırıldı
+  }
+  
+  // Performans istatistiklerini sadece gerektiğinde yazdır
+  if (currentTime - lastReport >= 5000) {
+    printPerformanceStats();
+  }
+  
+  // ESP8266 için yield() çağrısı - WDT reset'i önlemek için
+  yield();
+  
+  // Gecikme kaldırıldı - maksimum yanıt hızı için
+}
